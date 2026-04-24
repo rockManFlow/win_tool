@@ -720,7 +720,7 @@ public partial class Form1 : Form
 
     private TextBox CreateLogTextBox()
     {
-        return new TextBox
+        var box = new TextBox
         {
             Multiline = true,
             ReadOnly = true,
@@ -729,6 +729,14 @@ public partial class Form1 : Form
             Width = 860,
             Height = 230
         };
+
+        var menu = new ContextMenuStrip();
+        var clearItem = new ToolStripMenuItem("清空日志");
+        clearItem.Click += (_, _) => box.Clear();
+        menu.Items.Add(clearItem);
+        box.ContextMenuStrip = menu;
+
+        return box;
     }
 
     private GroupBox CreateLogGroup(string title, Control content)
