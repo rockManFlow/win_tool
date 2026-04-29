@@ -5,6 +5,11 @@ import os
 import sys
 from datetime import datetime
 
+# 将脚本所在目录添加到模块搜索路径，确保能导入同目录下的模块
+script_dir = os.path.dirname(os.path.abspath(__file__))
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
+
 
 def log(message: str) -> None:
     print(message, flush=True)
@@ -202,6 +207,129 @@ def cmd_speak_loop(text: str, interval_seconds: float) -> int:
     return result(True, "语音播报已结束。")
 
 
+def cmd_camera_probe(camera_index: int) -> int:
+    try:
+        import cv2
+    except Exception as ex:
+        return result(False, f"导入 cv2 失败: {ex}")
+
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        return result(False, "摄像头不可用，请检查设备或权限。")
+
+    try:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            return result(False, "摄像头打开成功，但无法读取画面。")
+        return result(True, "摄像头可用")
+    except Exception as ex:
+        return result(False, f"摄像头检测失败: {ex}")
+    finally:
+        cap.release()
+
+
+def cmd_photo_choice(input_dir: str, output_dir: str, target_class: str) -> int:
+    try:
+        from photo_choice import yolov8_photo_choice
+    except Exception as ex:
+        return result(False, f"导入 photo_choice 模块失败: {ex}")
+
+    if not os.path.isdir(input_dir):
+        return result(False, f"输入文件夹不存在: {input_dir}")
+
+    try:
+        log(f"开始图片分类...")
+        log(f"输入文件夹: {input_dir}")
+        log(f"输出文件夹: {output_dir}")
+        log(f"筛选类别: {target_class}")
+        
+        stats = yolov8_photo_choice(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            target_classes=[target_class],
+            log_callback=log
+        )
+        
+        msg = f"分类完成！总计 {stats['total']} 张图片，符合条件 {stats['matched']} 张，不符合 {stats['unmatched']} 张"
+        if stats['errors'] > 0:
+            msg += f"，处理失败 {stats['errors']} 张"
+        return result(True, msg)
+    except Exception as ex:
+        return result(False, f"图片分类失败: {ex}")
+
+
+def cmd_get_photo_kinds() -> int:
+    """获取 YOLOv8 支持的所有类别名称"""
+    try:
+        from photo_choice import yolov8_ocr_kind
+    except Exception as ex:
+        return result(False, f"导入 photo_choice 模块失败: {ex}")
+
+    try:
+        kinds = yolov8_ocr_kind()
+        # 返回 JSON 格式的类别列表
+        payload = {"success": True, "message": "获取成功", "kinds": kinds}
+        print(f"RESULT_JSON:{json.dumps(payload, ensure_ascii=False)}", flush=True)
+        return 0
+    except Exception as ex:
+        return result(False, f"获取类别失败: {ex}")
+
+
+def cmd_crowd_count(camera_index: int) -> int:
+    try:
+        import cv2
+        from ultralytics import YOLO
+    except Exception as ex:
+        return result(False, f"导入依赖失败: {ex}")
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(script_dir, "yolov8s.pt")
+    if not os.path.isfile(model_path):
+        # 兼容开发运行目录结构，向上查找项目根目录中的 yolov8s.pt
+        probe = script_dir
+        for _ in range(5):
+            candidate = os.path.join(probe, "yolov8s.pt")
+            if os.path.isfile(candidate):
+                model_path = candidate
+                break
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            probe = parent
+
+    if not os.path.isfile(model_path):
+        return result(False, "未找到模型文件 yolov8s.pt，请放在项目目录中。")
+
+    try:
+        model = YOLO(model_path)
+    except Exception as ex:
+        return result(False, f"加载 YOLO 模型失败: {ex}")
+
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        return result(False, "摄像头不可用，请检查设备或权限。")
+
+    try:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            return result(False, "无法读取摄像头画面。")
+
+        predictions = model.predict(
+            source=frame,
+            classes=[0],  # COCO: person
+            conf=0.25,
+            verbose=False,
+            imgsz=640
+        )
+        boxes = predictions[0].boxes if predictions else None
+        count = 0 if boxes is None else len(boxes)
+        return result(True, str(count))
+    except Exception as ex:
+        return result(False, f"统计失败: {ex}")
+    finally:
+        cap.release()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="WinTool Python bridge")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -222,6 +350,18 @@ def main() -> int:
     p_speak.add_argument("--text", required=True)
     p_speak.add_argument("--interval", type=float, default=1.0)
 
+    p_crowd = subparsers.add_parser("crowd_count")
+    p_crowd.add_argument("--camera", type=int, default=0)
+    p_probe = subparsers.add_parser("camera_probe")
+    p_probe.add_argument("--camera", type=int, default=0)
+
+    p_photo_choice = subparsers.add_parser("photo_choice")
+    p_photo_choice.add_argument("--input", required=True)
+    p_photo_choice.add_argument("--output", required=True)
+    p_photo_choice.add_argument("--class", dest="target_class", required=True)
+
+    p_photo_kinds = subparsers.add_parser("get_photo_kinds")
+
     args = parser.parse_args()
     log(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Python 任务启动: {args.command}")
 
@@ -234,6 +374,14 @@ def main() -> int:
         return cmd_file_size(args.path, args.threshold)
     if args.command == "speak_loop":
         return cmd_speak_loop(args.text, args.interval)
+    if args.command == "crowd_count":
+        return cmd_crowd_count(args.camera)
+    if args.command == "camera_probe":
+        return cmd_camera_probe(args.camera)
+    if args.command == "photo_choice":
+        return cmd_photo_choice(args.input, args.output, args.target_class)
+    if args.command == "get_photo_kinds":
+        return cmd_get_photo_kinds()
     return result(False, "未知命令")
 
 

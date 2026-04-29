@@ -35,6 +35,7 @@ public partial class Form1 : Form
     private TextBox _dedupLog = null!;
     private TextBox _fileSizeLog = null!;
     private TextBox _alarmLog = null!;
+    private TextBox _crowdLog = null!;
     private Label _videoPathLabel = null!;
     private Label _videoOutputLabel = null!;
     private Label _dedupFolderLabel = null!;
@@ -51,6 +52,19 @@ public partial class Form1 : Form
     private Button _stopAlarmButton = null!;
     private CancellationTokenSource? _alarmCts;
     private Process? _speechProcess;
+    private Label _crowdCurrentCountLabel = null!;
+    private Button _crowdStartButton = null!;
+    private Button _crowdStopButton = null!;
+    private CancellationTokenSource? _crowdMonitorCts;
+    private readonly Dictionary<string, int> _crowdHourStats = [];
+
+    // 图片分类页面相关字段
+    private string _photoChoiceInputPath = string.Empty;
+    private string _photoChoiceOutputPath = string.Empty;
+    private Label _photoChoiceInputLabel = null!;
+    private Label _photoChoiceOutputLabel = null!;
+    private ComboBox _photoChoiceKindCombo = null!;
+    private TextBox _photoChoiceLog = null!;
 
     public Form1()
     {
@@ -61,6 +75,7 @@ public partial class Form1 : Form
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         _alarmCts?.Cancel();
+        _crowdMonitorCts?.Cancel();
         StopSpeechLoop();
         base.OnFormClosing(e);
     }
@@ -127,6 +142,7 @@ public partial class Form1 : Form
 
         _submenuImage = CreateSubmenuPanel(
             ("图片去重", "image_dedup"),
+            ("图片分类", "photo_choice"),
             ("图片处理", "image_process")
         );
         layout.Controls.Add(_submenuImage);
@@ -137,7 +153,8 @@ public partial class Form1 : Form
 
         _submenuOther = CreateSubmenuPanel(
             ("文件大小工具", "file_size"),
-            ("智能闹钟工具", "alarm")
+            ("智能闹钟工具", "alarm"),
+            ("实时人流统计", "crowd_monitor")
         );
         layout.Controls.Add(_submenuOther);
 
@@ -251,8 +268,10 @@ public partial class Form1 : Form
 
         AddPage("video_extract", BuildVideoExtractPage());
         AddPage("image_dedup", BuildImageDedupPage());
+        AddPage("photo_choice", BuildPhotoChoicePage());
         AddPage("file_size", BuildFileSizePage());
         AddPage("alarm", BuildAlarmPage());
+        AddPage("crowd_monitor", BuildCrowdMonitorPage());
     }
 
     private void AddPage(string key, Panel page)
@@ -355,6 +374,174 @@ public partial class Form1 : Form
         return panel;
     }
 
+    private Panel BuildPhotoChoicePage()
+    {
+        var panel = CreatePageContainer();
+        var layout = CreateVerticalLayout(panel);
+        layout.Controls.Add(CreateTitleLabel("图片分类", _titleFont));
+        layout.Controls.Add(CreateDescriptionLabel("功能说明：支持选择指定文件夹中的图片，根据图片内容来筛选不同的图片到不同的文件夹下。\r\n使用步骤：1.选择输入文件夹 -> 2.选择输出文件夹 -> 3.选择分类类型 -> 4.开始执行 -> 5.查看日志"));
+
+        var group = CreateGroup("分类设置");
+        group.Height = 180;
+        var inside = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true };
+
+        _photoChoiceInputLabel = new Label { Text = "未选择文件夹", AutoSize = true, MaximumSize = new Size(600, 0) };
+        inside.Controls.Add(CreateActionRow("input", _photoChoiceInputLabel, SelectPhotoChoiceInputFolder, "选择需要处理的图片文件夹"));
+
+        _photoChoiceOutputLabel = new Label { Text = "未选择文件夹", AutoSize = true, MaximumSize = new Size(600, 0) };
+        inside.Controls.Add(CreateActionRow("output", _photoChoiceOutputLabel, SelectPhotoChoiceOutputFolder, "选择处理后图片保存到文件夹"));
+
+        var kindRow = new FlowLayoutPanel { Width = 760, Height = 40, FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
+        kindRow.Controls.Add(new Label { Text = "类型：", AutoSize = true, Font = _descFont, Margin = new Padding(0, 10, 4, 0) });
+        _photoChoiceKindCombo = new ComboBox
+        {
+            Width = 200,
+            Font = _descFont,
+            DropDownStyle = ComboBoxStyle.DropDownList
+        };
+        kindRow.Controls.Add(_photoChoiceKindCombo);
+        inside.Controls.Add(kindRow);
+
+        group.Controls.Add(inside);
+        layout.Controls.Add(group);
+
+        var runButton = CreatePrimaryButton("开始执行");
+        runButton.Click += async (_, _) => await RunPhotoChoiceAsync(runButton);
+        layout.Controls.Add(runButton);
+
+        _photoChoiceLog = CreateLogTextBox();
+        layout.Controls.Add(CreateLogGroup("分类日志", _photoChoiceLog));
+
+        // 异步加载类别列表
+        _ = LoadPhotoChoiceKindsAsync();
+
+        return panel;
+    }
+
+    private Panel CreateActionRow(string buttonText, Label targetLabel, Action onClick, string description)
+    {
+        var row = new Panel { Width = 760, Height = 40 };
+        var button = CreateActionButton(buttonText);
+        button.Location = new Point(0, 2);
+        button.Click += (_, _) => onClick();
+        var descLabel = new Label
+        {
+            Text = description,
+            AutoSize = true,
+            Font = _descFont,
+            ForeColor = ColorTranslator.FromHtml("#666666"),
+            Location = new Point(button.Width + 12, 8)
+        };
+        targetLabel.Location = new Point(button.Width + 12 + descLabel.PreferredWidth + 12, 8);
+        row.Controls.Add(button);
+        row.Controls.Add(descLabel);
+        row.Controls.Add(targetLabel);
+        return row;
+    }
+
+    private void SelectPhotoChoiceInputFolder()
+    {
+        using var dialog = new FolderBrowserDialog();
+        if (dialog.ShowDialog() != DialogResult.OK)
+        {
+            return;
+        }
+        _photoChoiceInputPath = dialog.SelectedPath;
+        _photoChoiceInputLabel.Text = $"已选：{_photoChoiceInputPath}";
+        AppendLog(_photoChoiceLog, $"✅ 选择输入文件夹：{_photoChoiceInputPath}");
+    }
+
+    private void SelectPhotoChoiceOutputFolder()
+    {
+        using var dialog = new FolderBrowserDialog();
+        if (dialog.ShowDialog() != DialogResult.OK)
+        {
+            return;
+        }
+        _photoChoiceOutputPath = dialog.SelectedPath;
+        _photoChoiceOutputLabel.Text = $"已选：{_photoChoiceOutputPath}";
+        AppendLog(_photoChoiceLog, $"✅ 选择输出文件夹：{_photoChoiceOutputPath}");
+    }
+
+    private async Task LoadPhotoChoiceKindsAsync()
+    {
+        AppendLog(_photoChoiceLog, "📌 正在加载分类类型列表...");
+        var result = await _pythonBridge.RunAsync("get_photo_kinds", msg => AppendLog(_photoChoiceLog, msg));
+        
+        if (result.Success && result.RawJson.HasValue && result.RawJson.Value.TryGetProperty("kinds", out var kindsElement))
+        {
+            var kinds = new List<string>();
+            foreach (var item in kindsElement.EnumerateArray())
+            {
+                var kind = item.GetString();
+                if (!string.IsNullOrEmpty(kind))
+                {
+                    kinds.Add(kind);
+                }
+            }
+
+            if (InvokeRequired)
+            {
+                Invoke(() => PopulateKindCombo(kinds));
+            }
+            else
+            {
+                PopulateKindCombo(kinds);
+            }
+            AppendLog(_photoChoiceLog, $"✅ 已加载 {kinds.Count} 个分类类型");
+        }
+        else
+        {
+            AppendLog(_photoChoiceLog, $"❌ 加载分类类型失败：{result.Message}");
+        }
+    }
+
+    private void PopulateKindCombo(List<string> kinds)
+    {
+        _photoChoiceKindCombo.Items.Clear();
+        foreach (var kind in kinds)
+        {
+            _photoChoiceKindCombo.Items.Add(kind);
+        }
+        if (_photoChoiceKindCombo.Items.Count > 0)
+        {
+            _photoChoiceKindCombo.SelectedIndex = 0;
+        }
+    }
+
+    private async Task RunPhotoChoiceAsync(Button runButton)
+    {
+        if (string.IsNullOrWhiteSpace(_photoChoiceInputPath))
+        {
+            MessageBox.Show("请先选择输入文件夹！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(_photoChoiceOutputPath))
+        {
+            MessageBox.Show("请先选择输出文件夹！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        if (_photoChoiceKindCombo.SelectedItem == null)
+        {
+            MessageBox.Show("请先选择分类类型！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        var selectedKind = _photoChoiceKindCombo.SelectedItem.ToString();
+        runButton.Enabled = false;
+        runButton.Text = "执行中...";
+        AppendLog(_photoChoiceLog, "⏳ 正在执行图片分类，请耐心等待...");
+
+        var args = $"photo_choice --input \"{_photoChoiceInputPath}\" --output \"{_photoChoiceOutputPath}\" --class \"{selectedKind}\"";
+        var result = await _pythonBridge.RunAsync(args, msg => AppendLog(_photoChoiceLog, msg));
+        
+        runButton.Enabled = true;
+        runButton.Text = "开始执行";
+
+        AppendLog(_photoChoiceLog, result.Success ? $"🎉 {result.Message}" : $"❌ {result.Message}");
+        MessageBox.Show(result.Message, result.Success ? "完成" : "失败", MessageBoxButtons.OK, result.Success ? MessageBoxIcon.Information : MessageBoxIcon.Error);
+    }
+
     private Panel BuildFileSizePage()
     {
         var panel = CreatePageContainer();
@@ -439,6 +626,51 @@ public partial class Form1 : Form
 
         _alarmLog = CreateLogTextBox();
         layout.Controls.Add(CreateLogGroup("闹钟日志", _alarmLog));
+        return panel;
+    }
+
+    private Panel BuildCrowdMonitorPage()
+    {
+        var panel = CreatePageContainer();
+        var layout = CreateVerticalLayout(panel);
+        layout.Controls.Add(CreateTitleLabel("实时人流统计", _titleFont));
+        layout.Controls.Add(CreateDescriptionLabel("调用本机摄像头，实时统计人数\r\n请保证摄像头是可用的，会按小时把统计人数数据，保存到当前项目所在路径data/monitor.txt中"));
+
+        var statusGroup = CreateGroup("实时状态");
+        statusGroup.Height = 120;
+        var statusLayout = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
+        var titleLabel = new Label
+        {
+            Text = "当前人数：",
+            AutoSize = true,
+            Font = new Font("Microsoft YaHei UI", 14, FontStyle.Bold),
+            Margin = new Padding(10, 20, 0, 0)
+        };
+        _crowdCurrentCountLabel = new Label
+        {
+            Text = "0",
+            AutoSize = true,
+            Font = new Font("Microsoft YaHei UI", 24, FontStyle.Bold),
+            ForeColor = Color.Green,
+            Margin = new Padding(8, 8, 0, 0)
+        };
+        statusLayout.Controls.Add(titleLabel);
+        statusLayout.Controls.Add(_crowdCurrentCountLabel);
+        statusGroup.Controls.Add(statusLayout);
+        layout.Controls.Add(statusGroup);
+
+        var buttonRow = new FlowLayoutPanel { FlowDirection = FlowDirection.LeftToRight, Width = 760, Height = 50 };
+        _crowdStartButton = CreatePrimaryButton("开始统计");
+        _crowdStartButton.Click += async (_, _) => await StartCrowdMonitorAsync();
+        _crowdStopButton = CreateDangerButton("停止统计");
+        _crowdStopButton.Enabled = false;
+        _crowdStopButton.Click += (_, _) => StopCrowdMonitor();
+        buttonRow.Controls.Add(_crowdStartButton);
+        buttonRow.Controls.Add(_crowdStopButton);
+        layout.Controls.Add(buttonRow);
+
+        _crowdLog = CreateLogTextBox();
+        layout.Controls.Add(CreateLogGroup("统计日志", _crowdLog));
         return panel;
     }
 
@@ -952,6 +1184,128 @@ public partial class Form1 : Form
     {
         _alarmCts?.Cancel();
         StopSpeechLoop();
+    }
+
+    private async Task StartCrowdMonitorAsync()
+    {
+        var probe = await _pythonBridge.RunAsync("camera_probe --camera 0", msg => AppendLog(_crowdLog, msg));
+        if (!probe.Success)
+        {
+            AppendLog(_crowdLog, $"❌ 摄像头校验失败：{probe.Message}");
+            MessageBox.Show($"摄像头不可用：{probe.Message}", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        _crowdMonitorCts?.Cancel();
+        _crowdMonitorCts = new CancellationTokenSource();
+        _crowdHourStats.Clear();
+        _crowdStartButton.Enabled = false;
+        _crowdStopButton.Enabled = true;
+        AppendLog(_crowdLog, "📷 摄像头可用，已开始实时统计，每10秒刷新一次。");
+
+        try
+        {
+            while (!_crowdMonitorCts.Token.IsCancellationRequested)
+            {
+                var args = "crowd_count --camera 0";
+                var result = await _pythonBridge.RunAsync(args, msg => AppendLog(_crowdLog, msg), _crowdMonitorCts.Token);
+                if (result.Success && int.TryParse(result.Message, out var count))
+                {
+                    _crowdCurrentCountLabel.Text = count.ToString();
+                    var hourKey = DateTime.Now.ToString("yyyyMMddHH");
+                    _crowdHourStats[hourKey] = _crowdHourStats.GetValueOrDefault(hourKey) + count;
+                    AppendLog(_crowdLog, $"✅ 当前人数：{count}");
+                }
+                else
+                {
+                    AppendLog(_crowdLog, $"❌ 统计失败：{result.Message}");
+                }
+
+                await Task.Delay(TimeSpan.FromSeconds(10), _crowdMonitorCts.Token);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            AppendLog(_crowdLog, "🛑 已停止实时统计。");
+        }
+        finally
+        {
+            _crowdStartButton.Enabled = true;
+            _crowdStopButton.Enabled = false;
+        }
+    }
+
+    private void StopCrowdMonitor()
+    {
+        _crowdMonitorCts?.Cancel();
+        SaveCrowdMonitorData();
+    }
+
+    private void SaveCrowdMonitorData()
+    {
+        try
+        {
+            var dataPath = GetMonitorDataPath();
+            var dir = Path.GetDirectoryName(dataPath);
+            if (!string.IsNullOrWhiteSpace(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            var merged = new Dictionary<string, int>(StringComparer.Ordinal);
+            if (File.Exists(dataPath))
+            {
+                foreach (var line in File.ReadAllLines(dataPath))
+                {
+                    var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length == 2 && int.TryParse(parts[1], out var value))
+                    {
+                        merged[parts[0]] = value;
+                    }
+                }
+            }
+
+            foreach (var pair in _crowdHourStats)
+            {
+                merged[pair.Key] = merged.GetValueOrDefault(pair.Key) + pair.Value;
+            }
+
+            if (merged.Count == 0)
+            {
+                merged[DateTime.Now.ToString("yyyyMMddHH")] = 0;
+            }
+
+            var lines = merged
+                .OrderBy(x => x.Key, StringComparer.Ordinal)
+                .Select(x => $"{x.Key} {x.Value}")
+                .ToArray();
+            File.WriteAllLines(dataPath, lines);
+            AppendLog(_crowdLog, $"💾 已写入统计数据：{dataPath}");
+        }
+        catch (Exception ex)
+        {
+            AppendLog(_crowdLog, $"❌ 写入 monitor.txt 失败：{ex.Message}");
+        }
+        finally
+        {
+            _crowdHourStats.Clear();
+        }
+    }
+
+    private static string GetMonitorDataPath()
+    {
+        var baseDir = AppContext.BaseDirectory;
+        var dir = new DirectoryInfo(baseDir);
+        while (dir is not null)
+        {
+            var csproj = dir.GetFiles("*.csproj").FirstOrDefault();
+            if (csproj is not null)
+            {
+                return Path.Combine(dir.FullName, "data", "monitor.txt");
+            }
+            dir = dir.Parent;
+        }
+        return Path.Combine(baseDir, "data", "monitor.txt");
     }
 
     private void StartSpeechLoop(string content)

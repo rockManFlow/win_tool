@@ -25,12 +25,12 @@ public sealed class PythonBridge
     {
         if (!File.Exists(PythonExePath))
         {
-            return new PythonRunResult(false, $"未找到 Python 解释器：{PythonExePath}");
+            return new PythonRunResult(false, $"未找到 Python 解释器：{PythonExePath}", null);
         }
 
         if (!File.Exists(ScriptPath))
         {
-            return new PythonRunResult(false, $"未找到 Python 桥接脚本：{ScriptPath}");
+            return new PythonRunResult(false, $"未找到 Python 桥接脚本：{ScriptPath}", null);
         }
 
         var psi = new ProcessStartInfo
@@ -102,18 +102,18 @@ public sealed class PythonBridge
         var exitCode = await tcs.Task.ConfigureAwait(false);
         if (cancellationToken.IsCancellationRequested)
         {
-            return new PythonRunResult(false, "任务已取消。");
+            return new PythonRunResult(false, "任务已取消。", null);
         }
 
         if (!string.IsNullOrWhiteSpace(resultJson))
         {
             try
             {
-                var payload = JsonSerializer.Deserialize<PythonPayload>(resultJson);
-                if (payload is not null)
-                {
-                    return new PythonRunResult(payload.success, payload.message ?? string.Empty);
-                }
+                using var doc = JsonDocument.Parse(resultJson);
+                var root = doc.RootElement;
+                var success = root.TryGetProperty("success", out var successProp) && successProp.GetBoolean();
+                var message = root.TryGetProperty("message", out var msgProp) ? msgProp.GetString() ?? string.Empty : string.Empty;
+                return new PythonRunResult(success, message, root.Clone());
             }
             catch
             {
@@ -122,8 +122,8 @@ public sealed class PythonBridge
         }
 
         return exitCode == 0
-            ? new PythonRunResult(true, "任务执行完成。")
-            : new PythonRunResult(false, $"任务执行失败，退出码：{exitCode}");
+            ? new PythonRunResult(true, "任务执行完成。", null)
+            : new PythonRunResult(false, $"任务执行失败，退出码：{exitCode}", null);
     }
 
     private static string ResolvePythonExe(string baseDir)
@@ -148,11 +148,6 @@ public sealed class PythonBridge
         return Path.Combine(baseDir, "python_bridge.py");
     }
 
-    private sealed class PythonPayload
-    {
-        public bool success { get; set; }
-        public string? message { get; set; }
-    }
 }
 
-public readonly record struct PythonRunResult(bool Success, string Message);
+public readonly record struct PythonRunResult(bool Success, string Message, JsonElement? RawJson);
