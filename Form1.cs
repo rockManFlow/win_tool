@@ -64,7 +64,25 @@ public partial class Form1 : Form
     private Label _photoChoiceInputLabel = null!;
     private Label _photoChoiceOutputLabel = null!;
     private ComboBox _photoChoiceKindCombo = null!;
+    private Button _photoChoiceRefreshButton = null!;
     private TextBox _photoChoiceLog = null!;
+
+    // 屏幕录制页面相关字段
+    private string _screenRecordOutputPath = string.Empty;
+    private Label _screenRecordOutputLabel = null!;
+    private ComboBox _screenRecordFpsCombo = null!;
+    private TextBox _screenRecordLog = null!;
+    private Button _screenRecordSelectRegionButton = null!;
+    private Button _screenRecordStartButton = null!;
+    private Button _screenRecordStopButton = null!;
+    private Label _screenRecordStatusLabel = null!;
+    private Label _screenRecordTimeLabel = null!;
+    private Label _screenRecordRegionLabel = null!;
+    private ScreenRecorder? _screenRecorder;
+    private CancellationTokenSource? _screenRecordTimerCts;
+    private DateTime _screenRecordStartTime;
+    private Rectangle _screenRecordRegion;
+    private RecordingBorder? _recordingBorder;
 
     public Form1()
     {
@@ -76,6 +94,10 @@ public partial class Form1 : Form
     {
         _alarmCts?.Cancel();
         _crowdMonitorCts?.Cancel();
+        _screenRecordTimerCts?.Cancel();
+        _screenRecorder?.Dispose();
+        _recordingBorder?.Close();
+        _recordingBorder?.Dispose();
         StopSpeechLoop();
         base.OnFormClosing(e);
     }
@@ -130,11 +152,12 @@ public partial class Form1 : Form
         video.Click += (_, _) => ToggleSubmenu(_submenuVideo, video);
         layout.Controls.Add(video);
 
-        _submenuVideo = CreateSubmenuPanel(
-            ("视频帧转图片", "video_extract"),
-            ("其他视频工具", "video_other")
-        );
-        layout.Controls.Add(_submenuVideo);
+    _submenuVideo = CreateSubmenuPanel(
+        ("视频帧转图片", "video_extract"),
+        ("屏幕录制", "screen_record"),
+        ("其他视频工具", "video_other")
+    );
+    layout.Controls.Add(_submenuVideo);
 
         var image = CreateMainMenuButton("图片");
         image.Click += (_, _) => ToggleSubmenu(_submenuImage, image);
@@ -267,6 +290,7 @@ public partial class Form1 : Form
         AddPage("image_process", BuildSimpleInfoPage("图片处理工具", "规划中..."));
 
         AddPage("video_extract", BuildVideoExtractPage());
+        AddPage("screen_record", BuildScreenRecordPage());
         AddPage("image_dedup", BuildImageDedupPage());
         AddPage("photo_choice", BuildPhotoChoicePage());
         AddPage("file_size", BuildFileSizePage());
@@ -326,6 +350,330 @@ public partial class Form1 : Form
         _videoLog = CreateLogTextBox();
         layout.Controls.Add(CreateLogGroup("提取日志", _videoLog));
         return panel;
+    }
+
+    private Panel BuildScreenRecordPage()
+    {
+        var panel = CreatePageContainer();
+        var layout = CreateVerticalLayout(panel);
+        layout.Controls.Add(CreateTitleLabel("屏幕录制工具", _titleFont));
+        layout.Controls.Add(CreateDescriptionLabel("功能说明：录制屏幕指定区域，输出 MP4 格式视频。\r\n使用步骤：1.选择输出文件夹 -> 2.选择录制区域 -> 3.设置帧率 -> 4.点击开始录制 -> 5.点击停止录制"));
+
+        // 录制设置组
+        var settingsGroup = CreateGroup("录制设置");
+        settingsGroup.Height = 180;
+        var settingsLayout = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true };
+
+        // 输出文件夹选择
+        _screenRecordOutputLabel = new Label { Text = "未选择输出文件夹", AutoSize = true, MaximumSize = new Size(600, 0) };
+        settingsLayout.Controls.Add(CreateActionRow("选择输出文件夹", _screenRecordOutputLabel, SelectScreenRecordOutputFolder));
+
+        // 录制区域选择
+        var regionRow = new Panel { Width = 760, Height = 40 };
+        _screenRecordSelectRegionButton = CreateActionButton("选择录制区域");
+        _screenRecordSelectRegionButton.Width = 130;
+        _screenRecordSelectRegionButton.Location = new Point(0, 2);
+        _screenRecordSelectRegionButton.Click += (_, _) => SelectScreenRecordRegion();
+        _screenRecordRegionLabel = new Label 
+        { 
+            Text = "未选择录制区域", 
+            AutoSize = true, 
+            MaximumSize = new Size(600, 0),
+            Location = new Point(142, 8)
+        };
+        regionRow.Controls.Add(_screenRecordSelectRegionButton);
+        regionRow.Controls.Add(_screenRecordRegionLabel);
+        settingsLayout.Controls.Add(regionRow);
+
+        // 帧率选择
+        var fpsRow = new FlowLayoutPanel { Width = 760, Height = 40, FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
+        fpsRow.Controls.Add(new Label { Text = "录制帧率：", AutoSize = true, Font = _descFont, Margin = new Padding(0, 10, 4, 0) });
+        _screenRecordFpsCombo = new ComboBox
+        {
+            Width = 100,
+            Font = _descFont,
+            DropDownStyle = ComboBoxStyle.DropDownList
+        };
+        _screenRecordFpsCombo.Items.AddRange(["15", "24", "30", "60"]);
+        _screenRecordFpsCombo.SelectedIndex = 2; // 默认30fps
+        fpsRow.Controls.Add(_screenRecordFpsCombo);
+        fpsRow.Controls.Add(new Label { Text = "fps（帧率越高，文件越大）", AutoSize = true, Font = new Font("Microsoft YaHei UI", 9), ForeColor = Color.Gray, Margin = new Padding(10, 10, 0, 0) });
+        settingsLayout.Controls.Add(fpsRow);
+
+        settingsGroup.Controls.Add(settingsLayout);
+        layout.Controls.Add(settingsGroup);
+
+        // 录制状态组
+        var statusGroup = CreateGroup("录制状态");
+        statusGroup.Height = 100;
+        var statusLayout = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false };
+        var statusTitleLabel = new Label
+        {
+            Text = "状态：",
+            AutoSize = true,
+            Font = new Font("Microsoft YaHei UI", 12, FontStyle.Bold),
+            Margin = new Padding(10, 15, 0, 0)
+        };
+        _screenRecordStatusLabel = new Label
+        {
+            Text = "未开始",
+            AutoSize = true,
+            Font = new Font("Microsoft YaHei UI", 12, FontStyle.Bold),
+            ForeColor = Color.Gray,
+            Margin = new Padding(4, 15, 0, 0)
+        };
+        var timeTitleLabel = new Label
+        {
+            Text = "      录制时长：",
+            AutoSize = true,
+            Font = new Font("Microsoft YaHei UI", 12, FontStyle.Bold),
+            Margin = new Padding(20, 15, 0, 0)
+        };
+        _screenRecordTimeLabel = new Label
+        {
+            Text = "00:00:00",
+            AutoSize = true,
+            Font = new Font("Microsoft YaHei UI", 14, FontStyle.Bold),
+            ForeColor = Color.Black,
+            Margin = new Padding(4, 13, 0, 0)
+        };
+        statusLayout.Controls.Add(statusTitleLabel);
+        statusLayout.Controls.Add(_screenRecordStatusLabel);
+        statusLayout.Controls.Add(timeTitleLabel);
+        statusLayout.Controls.Add(_screenRecordTimeLabel);
+        statusGroup.Controls.Add(statusLayout);
+        layout.Controls.Add(statusGroup);
+
+        // 按钮行
+        var buttonRow = new FlowLayoutPanel { FlowDirection = FlowDirection.LeftToRight, Width = 760, Height = 50 };
+        _screenRecordStartButton = CreatePrimaryButton("开始录制");
+        _screenRecordStartButton.Click += async (_, _) => await StartScreenRecordAsync();
+        _screenRecordStopButton = CreateDangerButton("停止录制");
+        _screenRecordStopButton.Enabled = false;
+        _screenRecordStopButton.Click += async (_, _) => await StopScreenRecordAsync();
+        buttonRow.Controls.Add(_screenRecordStartButton);
+        buttonRow.Controls.Add(_screenRecordStopButton);
+        layout.Controls.Add(buttonRow);
+
+        // 日志区域
+        _screenRecordLog = CreateLogTextBox();
+        layout.Controls.Add(CreateLogGroup("录制日志", _screenRecordLog));
+
+        return panel;
+    }
+
+    private void SelectScreenRecordRegion()
+    {
+        // 关闭之前的边框窗口
+        _recordingBorder?.Close();
+        _recordingBorder?.Dispose();
+        _recordingBorder = null;
+
+        // 最小化主窗口以便选择区域
+        var previousState = WindowState;
+        WindowState = FormWindowState.Minimized;
+        Thread.Sleep(300); // 等待窗口最小化动画完成
+
+        try
+        {
+            using var selector = new RegionSelector();
+            var result = selector.ShowDialog();
+
+            if (result == DialogResult.OK && selector.HasSelection)
+            {
+                _screenRecordRegion = selector.SelectedRegion;
+                _screenRecordRegionLabel.Text = $"已选择: {_screenRecordRegion.Width} x {_screenRecordRegion.Height} (位置: {_screenRecordRegion.X}, {_screenRecordRegion.Y})";
+                _screenRecordRegionLabel.ForeColor = Color.Green;
+                AppendLog(_screenRecordLog, $"已选择录制区域: {_screenRecordRegion.Width}x{_screenRecordRegion.Height}");
+
+                // 显示录制边框窗口
+                _recordingBorder = new RecordingBorder(_screenRecordRegion);
+                _recordingBorder.OnRegionChanged += region =>
+                {
+                    _screenRecordRegion = region;
+                    BeginInvoke(() =>
+                    {
+                        _screenRecordRegionLabel.Text = $"已选择: {region.Width} x {region.Height} (位置: {region.X}, {region.Y})";
+                        AppendLog(_screenRecordLog, $"录制区域已调整: {region.Width}x{region.Height}");
+                    });
+                };
+                _recordingBorder.OnCloseButtonClicked += () =>
+                {
+                    BeginInvoke(() =>
+                    {
+                        _recordingBorder = null;
+                        _screenRecordRegion = Rectangle.Empty;
+                        _screenRecordRegionLabel.Text = "未选择录制区域";
+                        _screenRecordRegionLabel.ForeColor = Color.Black;
+                        AppendLog(_screenRecordLog, "录制边框已关闭");
+                    });
+                };
+                _recordingBorder.Show();
+            }
+        }
+        finally
+        {
+            // 恢复窗口状态
+            WindowState = previousState;
+            Activate();
+        }
+    }
+
+    private void LoadScreenRecordMonitors()
+    {
+        // 此方法已不再需要，保留空实现以兼容
+    }
+
+    private void SelectScreenRecordOutputFolder()
+    {
+        using var dialog = new FolderBrowserDialog();
+        if (dialog.ShowDialog() != DialogResult.OK)
+        {
+            return;
+        }
+        _screenRecordOutputPath = dialog.SelectedPath;
+        _screenRecordOutputLabel.Text = $"已选：{_screenRecordOutputPath}";
+        AppendLog(_screenRecordLog, $"选择输出文件夹：{_screenRecordOutputPath}");
+    }
+
+    private Task StartScreenRecordAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_screenRecordOutputPath))
+        {
+            MessageBox.Show("请先选择输出文件夹！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return Task.CompletedTask;
+        }
+
+        if (_screenRecordRegion.Width <= 0 || _screenRecordRegion.Height <= 0)
+        {
+            MessageBox.Show("请先选择录制区域！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return Task.CompletedTask;
+        }
+
+        try
+        {
+            _screenRecordStartButton.Enabled = false;
+            _screenRecordSelectRegionButton.Enabled = false;
+            _screenRecordStopButton.Enabled = true;
+            _screenRecordStatusLabel.Text = "录制中";
+            _screenRecordStatusLabel.ForeColor = Color.Red;
+
+            // 生成输出文件名
+            var fileName = $"screen_record_{DateTime.Now:yyyyMMdd_HHmmss}.mp4";
+            var outputPath = Path.Combine(_screenRecordOutputPath, fileName);
+            var fps = int.Parse(_screenRecordFpsCombo.SelectedItem?.ToString() ?? "30");
+
+            AppendLog(_screenRecordLog, "正在初始化录屏...");
+
+            // 创建并初始化录屏器
+            _screenRecorder = new ScreenRecorder();
+            _screenRecorder.OnLog += msg => AppendLog(_screenRecordLog, msg);
+            _screenRecorder.OnError += ex => 
+            {
+                AppendLog(_screenRecordLog, $"录制错误: {ex.Message}");
+                Invoke(() => 
+                {
+                    _screenRecordStatusLabel.Text = "错误";
+                    _screenRecordStatusLabel.ForeColor = Color.Red;
+                });
+            };
+
+            // 设置录制区域（从边框窗口获取最新区域）
+            if (_recordingBorder != null)
+            {
+                _screenRecordRegion = _recordingBorder.CaptureRegion;
+            }
+            _screenRecorder.SetCaptureRegion(_screenRecordRegion);
+
+            // 禁用边框调整（录制时不能改变区域）
+            _recordingBorder?.SetAllowResize(false);
+
+            // 开始录制
+            _screenRecorder.StartRecording(outputPath, fps);
+            _screenRecordStartTime = DateTime.Now;
+
+            // 启动计时器更新录制时长
+            _screenRecordTimerCts = new CancellationTokenSource();
+            _ = UpdateRecordTimeAsync(_screenRecordTimerCts.Token);
+
+            AppendLog(_screenRecordLog, $"开始录制，输出文件：{outputPath}");
+        }
+        catch (Exception ex)
+        {
+            _screenRecordStartButton.Enabled = true;
+            _screenRecordSelectRegionButton.Enabled = true;
+            _screenRecordStopButton.Enabled = false;
+            _screenRecordStatusLabel.Text = "错误";
+            _screenRecordStatusLabel.ForeColor = Color.Red;
+            AppendLog(_screenRecordLog, $"启动录制失败：{ex.Message}");
+            MessageBox.Show($"启动录制失败：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        return Task.CompletedTask;
+    }
+
+    private async Task StopScreenRecordAsync()
+    {
+        try
+        {
+            _screenRecordStopButton.Enabled = false;
+            _screenRecordStatusLabel.Text = "正在停止...";
+            _screenRecordStatusLabel.ForeColor = Color.Orange;
+
+            _screenRecordTimerCts?.Cancel();
+
+            if (_screenRecorder != null)
+            {
+                await _screenRecorder.StopRecordingAsync();
+                _screenRecorder.Dispose();
+                _screenRecorder = null;
+            }
+
+            // 重新启用边框调整
+            _recordingBorder?.SetAllowResize(true);
+
+            _screenRecordStatusLabel.Text = "已停止";
+            _screenRecordStatusLabel.ForeColor = Color.Green;
+            _screenRecordStartButton.Enabled = true;
+            _screenRecordSelectRegionButton.Enabled = true;
+
+            AppendLog(_screenRecordLog, "录制已停止，视频文件已保存");
+            MessageBox.Show("录制完成！视频文件已保存到输出文件夹。", "完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            _screenRecordStartButton.Enabled = true;
+            _screenRecordSelectRegionButton.Enabled = true;
+            _recordingBorder?.SetAllowResize(true);
+            _screenRecordStatusLabel.Text = "错误";
+            _screenRecordStatusLabel.ForeColor = Color.Red;
+            AppendLog(_screenRecordLog, $"停止录制失败：{ex.Message}");
+            MessageBox.Show($"停止录制失败：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private async Task UpdateRecordTimeAsync(CancellationToken token)
+    {
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                var elapsed = DateTime.Now - _screenRecordStartTime;
+                var timeStr = elapsed.ToString(@"hh\:mm\:ss");
+                if (InvokeRequired)
+                {
+                    Invoke(() => _screenRecordTimeLabel.Text = timeStr);
+                }
+                else
+                {
+                    _screenRecordTimeLabel.Text = timeStr;
+                }
+                await Task.Delay(1000, token);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // 正常取消
+        }
     }
 
     private Panel BuildImageDedupPage()
@@ -400,6 +748,36 @@ public partial class Form1 : Form
             DropDownStyle = ComboBoxStyle.DropDownList
         };
         kindRow.Controls.Add(_photoChoiceKindCombo);
+        
+        // 刷新按钮
+        _photoChoiceRefreshButton = new Button
+        {
+            Text = "刷新",
+            Width = 60,
+            Height = 28,
+            Font = _descFont,
+            BackColor = ColorTranslator.FromHtml("#3498DB"),
+            ForeColor = Color.White,
+            FlatStyle = FlatStyle.Flat,
+            Margin = new Padding(10, 6, 0, 0),
+            Cursor = Cursors.Hand
+        };
+        _photoChoiceRefreshButton.FlatAppearance.BorderSize = 0;
+        _photoChoiceRefreshButton.Click += async (_, _) => await RefreshPhotoChoiceKindsAsync();
+        kindRow.Controls.Add(_photoChoiceRefreshButton);
+        
+        // 加载状态提示
+        var kindStatusLabel = new Label
+        {
+            Text = "",
+            AutoSize = true,
+            Font = new Font("Microsoft YaHei UI", 9),
+            ForeColor = Color.Gray,
+            Margin = new Padding(10, 10, 0, 0),
+            Name = "kindStatusLabel"
+        };
+        kindRow.Controls.Add(kindStatusLabel);
+        
         inside.Controls.Add(kindRow);
 
         group.Controls.Add(inside);
@@ -465,38 +843,92 @@ public partial class Form1 : Form
 
     private async Task LoadPhotoChoiceKindsAsync()
     {
-        AppendLog(_photoChoiceLog, "📌 正在加载分类类型列表...");
-        var result = await _pythonBridge.RunAsync("get_photo_kinds", msg => AppendLog(_photoChoiceLog, msg));
-        
-        if (result.Success && result.RawJson.HasValue && result.RawJson.Value.TryGetProperty("kinds", out var kindsElement))
-        {
-            var kinds = new List<string>();
-            foreach (var item in kindsElement.EnumerateArray())
-            {
-                var kind = item.GetString();
-                if (!string.IsNullOrEmpty(kind))
-                {
-                    kinds.Add(kind);
-                }
-            }
+        await LoadPhotoChoiceKindsInternalAsync(isManualRefresh: false);
+    }
 
-            if (InvokeRequired)
+    private async Task RefreshPhotoChoiceKindsAsync()
+    {
+        await LoadPhotoChoiceKindsInternalAsync(isManualRefresh: true);
+    }
+
+    private async Task LoadPhotoChoiceKindsInternalAsync(bool isManualRefresh)
+    {
+        // 禁用刷新按钮，显示加载状态
+        if (_photoChoiceRefreshButton != null)
+        {
+            _photoChoiceRefreshButton.Enabled = false;
+            _photoChoiceRefreshButton.Text = "加载中";
+        }
+
+        var actionText = isManualRefresh ? "刷新" : "加载";
+        AppendLog(_photoChoiceLog, $"📌 正在{actionText}分类类型列表...");
+
+        try
+        {
+            var result = await _pythonBridge.RunAsync("get_photo_kinds", msg => AppendLog(_photoChoiceLog, msg));
+
+            if (result.Success && result.RawJson.HasValue && result.RawJson.Value.TryGetProperty("kinds", out var kindsElement))
             {
-                Invoke(() => PopulateKindCombo(kinds));
+                var kinds = new List<string>();
+                foreach (var item in kindsElement.EnumerateArray())
+                {
+                    var kind = item.GetString();
+                    if (!string.IsNullOrEmpty(kind))
+                    {
+                        kinds.Add(kind);
+                    }
+                }
+
+                if (InvokeRequired)
+                {
+                    Invoke(() => PopulateKindCombo(kinds, isManualRefresh));
+                }
+                else
+                {
+                    PopulateKindCombo(kinds, isManualRefresh);
+                }
+                AppendLog(_photoChoiceLog, $"✅ 已{actionText} {kinds.Count} 个分类类型");
             }
             else
             {
-                PopulateKindCombo(kinds);
+                AppendLog(_photoChoiceLog, $"❌ {actionText}分类类型失败：{result.Message}");
+                if (isManualRefresh)
+                {
+                    MessageBox.Show($"刷新失败：{result.Message}\n\n请检查 Python 环境是否正常。", "刷新失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
             }
-            AppendLog(_photoChoiceLog, $"✅ 已加载 {kinds.Count} 个分类类型");
         }
-        else
+        catch (Exception ex)
         {
-            AppendLog(_photoChoiceLog, $"❌ 加载分类类型失败：{result.Message}");
+            AppendLog(_photoChoiceLog, $"❌ {actionText}分类类型异常：{ex.Message}");
+            if (isManualRefresh)
+            {
+                MessageBox.Show($"刷新异常：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+        finally
+        {
+            // 恢复刷新按钮状态
+            if (_photoChoiceRefreshButton != null)
+            {
+                if (InvokeRequired)
+                {
+                    Invoke(() =>
+                    {
+                        _photoChoiceRefreshButton.Enabled = true;
+                        _photoChoiceRefreshButton.Text = "刷新";
+                    });
+                }
+                else
+                {
+                    _photoChoiceRefreshButton.Enabled = true;
+                    _photoChoiceRefreshButton.Text = "刷新";
+                }
+            }
         }
     }
 
-    private void PopulateKindCombo(List<string> kinds)
+    private void PopulateKindCombo(List<string> kinds, bool showMessage = false)
     {
         _photoChoiceKindCombo.Items.Clear();
         foreach (var kind in kinds)
